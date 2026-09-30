@@ -1,0 +1,865 @@
+#!/usr/bin/env bash
+#
+# qemuctl — a light, kcli-style manager for qemu/KVM virtual machines built
+# from cloud images. Images are read-only bases; each VM is a qcow2 overlay
+# with its own cloud-init seed, sockets and auto-allocated host ports, so
+# many VMs can run side by side on one host.
+#
+#   qemuctl help              full usage
+#   qemuctl doctor            check dependencies and KVM access
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------- config ---
+QEMUCTL_HOME="${QEMUCTL_HOME:-$HOME/vm_manager}"
+IMAGES_DIR="$QEMUCTL_HOME/images"
+VMS_DIR="$QEMUCTL_HOME/vms"
+QEMUCTL_PORT_BASE="${QEMUCTL_PORT_BASE:-22000}"
+QEMUCTL_PORT_RANGE="${QEMUCTL_PORT_RANGE:-1000}"
+QEMUCTL_DEFAULT_CPUS="${QEMUCTL_DEFAULT_CPUS:-2}"
+QEMUCTL_DEFAULT_MEM="${QEMUCTL_DEFAULT_MEM:-4G}"
+QEMUCTL_DEFAULT_IMAGE="${QEMUCTL_DEFAULT_IMAGE:-}"
+QEMUCTL_SSH_USER="${QEMUCTL_SSH_USER:-ubuntu}"
+QEMUCTL_PASSWORD="${QEMUCTL_PASSWORD:-pass}"
+QEMUCTL_STOP_TIMEOUT="${QEMUCTL_STOP_TIMEOUT:-60}"
+QEMUCTL_SYNC_LOCAL="${QEMUCTL_SYNC_LOCAL:-}"     # default local dir for 'vm sync'
+QEMUCTL_SYNC_REMOTE="${QEMUCTL_SYNC_REMOTE:-}"   # default dir inside the VM for 'vm sync'
+QEMU_BIN="${QEMU_BIN:-qemu-system-x86_64}"
+
+declare -A IMAGE_ALIASES=(
+  [ubuntu-22.04]="https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
+  [ubuntu-24.04]="https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+)
+
+# --------------------------------------------------------------- helpers ---
+log()  { printf '%s\n' "$*" >&2; }
+die()  { log "qemuctl: $*"; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+need() { have "$1" || die "missing required tool: $1${2:+ (install: $2)}"; }
+
+validate_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+    || die "invalid name '$1' (use letters, digits, '_', '.', '-'; must not start with '.' or '-')"
+}
+validate_int()  { [[ "$1" =~ ^[0-9]+$ ]] || die "expected a number for $2, got '$1'"; }
+validate_mem()  { [[ "$1" =~ ^[0-9]+[MGmg]?$ ]] || die "expected memory like 512M or 4G, got '$1'"; }
+validate_port() { validate_int "$1" "port"; (( $1 >= 1 && $1 <= 65535 )) || die "port out of range: $1"; }
+
+# How to reach /dev/kvm, decided once per run:
+#   direct  — /dev/kvm is writable (user is in the kvm group)
+#   sudo-g  — `sudo -g kvm`: keeps our uid, only adds the kvm group, so the
+#             pidfile, sockets and logs stay owned by us (needs a sudoers rule
+#             with a group list, e.g. "(ALL:ALL) NOPASSWD: ALL")
+#   sudo    — plain sudo, qemu runs as root; qemuctl then uses sudo to reach the
+#             root-owned sockets and to signal the process
+KVM_MODE=""
+kvm_mode() {
+  if [ -z "$KVM_MODE" ]; then
+    if [ ! -e /dev/kvm ] || [ -w /dev/kvm ]; then KVM_MODE=direct
+    elif sudo -n -g kvm true 2>/dev/null; then KVM_MODE=sudo-g
+    else KVM_MODE=sudo; fi
+  fi
+  echo "$KVM_MODE"
+}
+kvm_prefix() {
+  case "$(kvm_mode)" in
+    sudo-g) printf 'sudo -g kvm ' ;;
+    sudo) printf 'sudo ' ;;
+  esac
+}
+run_qemu() {
+  case "$(kvm_mode)" in
+    sudo-g) sudo -g kvm "$@" ;;
+    sudo) sudo "$@" ;;
+    *) "$@" ;;
+  esac
+}
+
+# Connect stdin/stdout to a unix socket. Uses sudo when the socket is not
+# writable by us (e.g. a VM started by root).
+sock_cmd() {
+  local sock=$1 pre=()
+  [ -w "$sock" ] || pre=(sudo)
+  if have socat; then
+    printf '%s\n' "${pre[@]}" socat - "UNIX-CONNECT:$sock"
+  else
+    printf '%s\n' "${pre[@]}" nc -U "$sock"
+  fi
+}
+sock_send() {  # sock_send <socket> <line>
+  local cmd
+  mapfile -t cmd < <(sock_cmd "$1")
+  printf '%s\n' "$2" | timeout 5 "${cmd[@]}" >/dev/null 2>&1 || true
+}
+
+qemu_img_field() {  # qemu_img_field <file> <field>
+  # -U: read even while a running VM holds the image lock
+  qemu-img info -U "$1" 2>/dev/null | awk -F': ' -v f="$2" '$1==f {print $2; exit}'
+}
+
+# ------------------------------------------------------- port allocation ---
+listening_ports() {
+  ss -Hltn 2>/dev/null | awk '{print $4}' | sed 's/.*://' | grep -E '^[0-9]+$' | sort -u
+}
+# All host ports recorded in every vm.conf.
+conf_ports() {
+  local c
+  for c in "$VMS_DIR"/*/vm.conf; do
+    [ -e "$c" ] || continue
+    conf_ports_of "$(basename "$(dirname "$c")")"
+  done
+}
+port_owner() {  # port_owner <port> -> name of VM that has it recorded, if any
+  local c vm
+  for c in "$VMS_DIR"/*/vm.conf; do
+    [ -e "$c" ] || continue
+    vm=$(basename "$(dirname "$c")")
+    if conf_ports_of "$vm" | grep -qx "$1"; then echo "$vm"; return 0; fi
+  done
+  return 1
+}
+conf_ports_of() {
+  (
+    SSH_PORT="" PORTS=""
+    # shellcheck disable=SC1090
+    . "$VMS_DIR/$1/vm.conf"
+    [ -n "$SSH_PORT" ] && echo "$SSH_PORT"
+    for m in $PORTS; do echo "${m%%:*}"; done
+  )
+}
+
+TAKEN=()   # ports claimed during the current command (not yet written to disk)
+ALLOC=""   # result of alloc_port (set, not echoed, so TAKEN survives — no subshell)
+alloc_port() {  # first free host port: not listening, not in any vm.conf, not claimed in this run
+  local p end=$((QEMUCTL_PORT_BASE + QEMUCTL_PORT_RANGE)) used
+  used=$( { listening_ports; conf_ports; printf '%s\n' "${TAKEN[@]}"; } | sort -u )
+  for ((p = QEMUCTL_PORT_BASE; p < end; p++)); do
+    if ! grep -qx "$p" <<<"$used"; then
+      TAKEN+=("$p"); ALLOC=$p; return 0
+    fi
+  done
+  die "no free host port in $QEMUCTL_PORT_BASE-$((end - 1)) (raise QEMUCTL_PORT_RANGE)"
+}
+claim_port() {  # claim_port <port> [exclude-vm] — verify a pinned port is free
+  local p=$1 owner
+  validate_port "$p"
+  if listening_ports | grep -qx "$p"; then die "host port $p is already in use on this host"; fi
+  if owner=$(port_owner "$p") && [ "$owner" != "${2:-}" ]; then die "host port $p is reserved by VM '$owner'"; fi
+  for t in "${TAKEN[@]}"; do [ "$t" = "$p" ] && die "host port $p requested twice"; done
+  TAKEN+=("$p")
+}
+
+# -------------------------------------------------------------- VM state ---
+vm_exists() { [ -f "$VMS_DIR/$1/vm.conf" ]; }
+require_vm() { validate_name "$1"; vm_exists "$1" || die "no such VM: $1 (see 'qemuctl vm list')"; }
+load_vm() {
+  require_vm "$1"
+  VM=$1; VM_DIR="$VMS_DIR/$1"
+  IMAGE="" CPUS="" MEM="" SSH_PORT="" PORTS="" CREATED=""
+  # shellcheck disable=SC1091
+  . "$VM_DIR/vm.conf"
+}
+write_conf() {  # write_conf <dir> <image> <cpus> <mem> <ssh_port> <ports> <created>
+  cat >"$1/vm.conf" <<EOF
+# generated by qemuctl — edit only while the VM is stopped
+IMAGE='$2'
+CPUS='$3'
+MEM='$4'
+SSH_PORT='$5'
+PORTS='$6'
+CREATED='$7'
+EOF
+}
+vm_pid() {  # prints pid if VM $1 is running
+  local pf="$VMS_DIR/$1/qemu.pid" pid
+  [ -f "$pf" ] || return 1
+  pid=$(tr -d '[:space:]' <"$pf")
+  [ -n "$pid" ] && [ -d "/proc/$pid" ] || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q -- "qemu-system[^ ]* -name $1 " || return 1
+  echo "$pid"
+}
+is_running() { vm_pid "$1" >/dev/null 2>&1; }
+clean_stale() { rm -f "$VMS_DIR/$1"/{qemu.pid,monitor.sock,serial.sock}; }
+require_stopped() { ! is_running "$1" || die "VM '$1' is running (pid $(vm_pid "$1")); stop it first"; }
+vm_state() { if is_running "$1"; then echo running; else echo stopped; fi; }
+
+image_path() { echo "$IMAGES_DIR/$1.qcow2"; }
+require_image() { validate_name "$1"; [ -f "$(image_path "$1")" ] || die "no such image: $1 (see 'qemuctl image list')"; }
+image_users() {  # VMs whose conf references image $1
+  local c
+  for c in "$VMS_DIR"/*/vm.conf; do
+    [ -e "$c" ] || continue
+    grep -qx "IMAGE='$1'" "$c" && basename "$(dirname "$c")"
+  done
+  return 0
+}
+
+# ------------------------------------------------------------ cloud-init ---
+write_seed() {  # write_seed <vm>
+  local d="$VMS_DIR/$1"
+  cat >"$d/user-data" <<EOF
+#cloud-config
+hostname: $1
+password: $QEMUCTL_PASSWORD
+chpasswd: { expire: False }
+ssh_pwauth: True
+EOF
+  cat >"$d/meta-data" <<EOF
+instance-id: $1-$(date +%s)
+local-hostname: $1
+EOF
+  rm -f "$d/seed.img"
+  if have cloud-localds; then
+    cloud-localds "$d/seed.img" "$d/user-data" "$d/meta-data"
+  elif have genisoimage; then
+    genisoimage -quiet -output "$d/seed.img" -volid cidata -joliet -rock "$d/user-data" "$d/meta-data"
+  elif have xorriso; then
+    xorriso -as mkisofs -quiet -output "$d/seed.img" -volid cidata -joliet -rock "$d/user-data" "$d/meta-data" 2>/dev/null
+  else
+    die "need cloud-localds (apt install cloud-image-utils) or genisoimage to build the cloud-init seed"
+  fi
+}
+
+# ------------------------------------------------------------ qemu cmd ---
+# After a plain-sudo start qemu's runtime files are root-owned and 0600;
+# hand them back so qemuctl (and the console) can use them without sudo.
+fix_owner() {
+  [ "$(kvm_mode)" = sudo ] || return 0
+  local f files=()
+  for f in qemu.pid serial.log monitor.sock serial.sock; do
+    [ -e "$VM_DIR/$f" ] && files+=("$VM_DIR/$f")
+  done
+  [ ${#files[@]} -eq 0 ] || sudo chown "$(id -u):$(id -g)" "${files[@]}"
+}
+
+build_qemu_cmd() {  # uses loaded VM vars, fills QEMU_CMD array
+  local d="$VM_DIR" fwd="hostfwd=tcp::${SSH_PORT}-:22" m
+  for m in $PORTS; do fwd+=",hostfwd=tcp::${m%%:*}-:${m##*:}"; done
+  # shellcheck disable=SC2054  # commas live inside quoted qemu option strings
+  QEMU_CMD=(
+    "$QEMU_BIN" -name "$VM"
+    -enable-kvm -cpu host -smp "$CPUS" -m "$MEM"
+    -drive "file=$d/disk.qcow2,format=qcow2,if=virtio"
+    -drive "file=$d/seed.img,format=raw,if=virtio"
+    -device virtio-net-pci,netdev=n0
+    -netdev "user,id=n0,$fwd"
+    -chardev "socket,id=ser0,path=$d/serial.sock,server=on,wait=off,logfile=$d/serial.log,logappend=on"
+    -serial chardev:ser0
+    -monitor "unix:$d/monitor.sock,server=on,wait=off"
+    -pidfile "$d/qemu.pid"
+    -display none -daemonize
+  )
+}
+
+# ================================================================ doctor ====
+cmd_doctor() {
+  local ok=0 t
+  echo "qemuctl home : $QEMUCTL_HOME"
+  echo "images     : $(ls "$IMAGES_DIR"/*.qcow2 2>/dev/null | wc -l)"
+  echo "vms        : $(ls -d "$VMS_DIR"/*/ 2>/dev/null | wc -l)"
+  echo
+  check() { if have "$1"; then printf '  [ok]      %-18s %s\n' "$1" "$(command -v "$1")"; else printf '  [MISSING] %-18s %s\n' "$1" "$2"; ok=1; fi; }
+  check "$QEMU_BIN" "apt install qemu-system-x86"
+  check qemu-img       "apt install qemu-utils"
+  check ss             "apt install iproute2"
+  check ssh            "apt install openssh-client"
+  if have cloud-localds || have genisoimage || have xorriso; then
+    for t in cloud-localds genisoimage xorriso; do have "$t" && printf '  [ok]      %-18s %s\n' "$t" "$(command -v "$t")"; done
+  else
+    printf '  [MISSING] %-18s %s\n' "cloud-localds" "apt install cloud-image-utils   (seed builder)"; ok=1
+  fi
+  if have socat; then printf '  [ok]      %-18s %s\n' socat "$(command -v socat)"
+  elif have nc; then printf '  [ok]      %-18s %s (socat recommended: apt install socat)\n' nc "$(command -v nc)"
+  else printf '  [MISSING] %-18s %s\n' socat "apt install socat   (console/monitor access)"; ok=1; fi
+  if have wget || have curl; then :; else printf '  [MISSING] %-18s %s\n' wget "apt install wget"; ok=1; fi
+  echo
+  if [ ! -e /dev/kvm ]; then
+    echo "  [MISSING] /dev/kvm — KVM not available (nested virt / BIOS?)"; ok=1
+  elif [ -w /dev/kvm ]; then
+    echo "  [ok]      /dev/kvm writable — qemu runs without sudo"
+  else
+    case "$(kvm_mode)" in
+      sudo-g) echo "  [warn]    /dev/kvm not writable — qemu will run via 'sudo -g kvm' (files stay yours)." ;;
+      sudo)   echo "  [warn]    /dev/kvm not writable — qemu will run as root via sudo." ;;
+    esac
+    echo "            To avoid sudo:  sudo usermod -aG kvm $USER   (then log in again)"
+  fi
+  return $ok
+}
+
+# ================================================================ images ====
+usage_image() {
+  cat <<EOF
+Usage: qemuctl image <command>
+
+  list                                   show base images
+  pull <alias|URL> [--name N] [--resize +10G]
+                                         download a cloud image (aliases: ${!IMAGE_ALIASES[*]})
+  import <file> [--name N]               copy a local qcow2/raw file into the image store
+  create-from <vm> <image> [--compress]  flatten a stopped VM's disk into a new base image
+  delete <image>                         remove an image (refused while VMs use it)
+EOF
+}
+
+cmd_image_list() {
+  local f name vsize dsize users
+  printf '%-24s %-12s %-12s %s\n' NAME VIRTUAL ON-DISK USED-BY
+  for f in "$IMAGES_DIR"/*.qcow2; do
+    [ -e "$f" ] || continue
+    name=$(basename "$f" .qcow2)
+    vsize=$(qemu_img_field "$f" "virtual size" | awk '{print $1 $2}')
+    dsize=$(qemu_img_field "$f" "disk size" | awk '{print $1 $2}')
+    users=$(image_users "$name" | paste -sd, -)
+    printf '%-24s %-12s %-12s %s\n' "$name" "${vsize:-?}" "${dsize:-?}" "${users:--}"
+  done
+}
+
+cmd_image_pull() {
+  local src="" name="" resize="" url
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name=$2; shift 2 ;;
+      --resize) resize=$2; shift 2 ;;
+      -h|--help) usage_image; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$src" ] || die "unexpected argument: $1"; src=$1; shift ;;
+    esac
+  done
+  [ -n "$src" ] || die "usage: qemuctl image pull <alias|URL> [--name N] [--resize +10G]"
+  if [ -n "${IMAGE_ALIASES[$src]:-}" ]; then
+    url=${IMAGE_ALIASES[$src]}; [ -n "$name" ] || name=$src
+  else
+    url=$src
+    [ -n "$name" ] || { name=$(basename "$url"); name=${name%.img}; name=${name%.qcow2}; }
+  fi
+  validate_name "$name"
+  need qemu-img "apt install qemu-utils"
+  local dst; dst=$(image_path "$name")
+  [ ! -e "$dst" ] || die "image '$name' already exists"
+  mkdir -p "$IMAGES_DIR"
+  log "pulling $url -> $dst"
+  if have wget; then wget -q --show-progress -c -O "$dst.part" "$url"
+  elif have curl; then curl -fL --progress-bar -C - -o "$dst.part" "$url"
+  else die "need wget or curl"; fi
+  local fmt; fmt=$(qemu_img_field "$dst.part" "file format")
+  if [ "$fmt" = qcow2 ]; then
+    mv "$dst.part" "$dst"
+  else
+    log "converting from ${fmt:-unknown} to qcow2"
+    qemu-img convert -O qcow2 "$dst.part" "$dst" && rm -f "$dst.part"
+  fi
+  if [ -n "$resize" ]; then qemu-img resize -q "$dst" "$resize"; fi
+  log "image '$name' ready"
+}
+
+cmd_image_import() {
+  local src="" name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --name) name=$2; shift 2 ;;
+      -h|--help) usage_image; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$src" ] || die "unexpected argument: $1"; src=$1; shift ;;
+    esac
+  done
+  [ -n "$src" ] || die "usage: qemuctl image import <file> [--name N]"
+  [ -f "$src" ] || die "no such file: $src"
+  [ -n "$name" ] || { name=$(basename "$src"); name=${name%.img}; name=${name%.qcow2}; }
+  validate_name "$name"
+  need qemu-img "apt install qemu-utils"
+  local dst; dst=$(image_path "$name")
+  [ ! -e "$dst" ] || die "image '$name' already exists"
+  mkdir -p "$IMAGES_DIR"
+  local fmt; fmt=$(qemu_img_field "$src" "file format")
+  if [ "$fmt" = qcow2 ] && [ -z "$(qemu_img_field "$src" "backing file")" ]; then
+    cp --reflink=auto "$src" "$dst.part"
+  else
+    log "converting from ${fmt:-unknown} to standalone qcow2"
+    qemu-img convert -O qcow2 "$src" "$dst.part"
+  fi
+  mv "$dst.part" "$dst"
+  log "image '$name' imported"
+}
+
+cmd_image_create_from() {
+  local compress=() args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --compress|-c) compress=(-c); shift ;;
+      -h|--help) usage_image; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  [ ${#args[@]} -eq 2 ] || die "usage: qemuctl image create-from <vm> <image> [--compress]"
+  load_vm "${args[0]}"; validate_name "${args[1]}"
+  require_stopped "$VM"
+  need qemu-img "apt install qemu-utils"
+  local dst; dst=$(image_path "${args[1]}")
+  [ ! -e "$dst" ] || die "image '${args[1]}' already exists"
+  mkdir -p "$IMAGES_DIR"
+  log "flattening $VM_DIR/disk.qcow2 -> $dst${compress:+ (compressed)}"
+  qemu-img convert -O qcow2 "${compress[@]}" "$VM_DIR/disk.qcow2" "$dst.part"
+  mv "$dst.part" "$dst"
+  log "image '${args[1]}' created from VM '$VM'; spawn with: qemuctl vm create <name> --image ${args[1]}"
+}
+
+cmd_image_delete() {
+  [ $# -eq 1 ] || die "usage: qemuctl image delete <image>"
+  require_image "$1"
+  local users; users=$(image_users "$1" | paste -sd, -)
+  [ -z "$users" ] || die "image '$1' is the backing file of VM(s): $users — delete or flatten them first"
+  rm -f "$(image_path "$1")"
+  log "image '$1' deleted"
+}
+
+cmd_image() {
+  local sub=${1:-list}; shift || true
+  case "$sub" in
+    list|ls) cmd_image_list "$@" ;;
+    pull|get|download) cmd_image_pull "$@" ;;
+    import|add) cmd_image_import "$@" ;;
+    create-from|snapshot|export) cmd_image_create_from "$@" ;;
+    delete|rm) cmd_image_delete "$@" ;;
+    -h|--help|help) usage_image ;;
+    *) usage_image >&2; log "qemuctl: unknown image command: $sub"; exit 2 ;;
+  esac
+}
+
+# =================================================================== VMs ====
+usage_vm() {
+  cat <<EOF
+Usage: qemuctl vm <command>
+
+  create <name> [--image I] [--cpus N] [--mem 4G] [--disk +10G]
+                [-p [host:]guest ...] [--ssh-port N] [--start]
+                                         create a VM as an overlay on an image
+  start <name> [--dry-run]               boot in the background
+  stop <name> [--force]                  ACPI shutdown (wait ${QEMUCTL_STOP_TIMEOUT}s), then kill; --force kills now
+  restart <name>
+  list                                   show all VMs and their host ports
+  info <name>                            show config, state and file locations
+  ssh <name> [-- cmd ...]                ssh into the VM via its forwarded port
+  scp <name> [scp opts] <src>... <dst>   copy files; prefix a path with ':' to mean inside the VM
+  sync <name> push|pull [local] [remote] [--delete] [--git] [-n] [--exclude P]...
+                                         rsync a directory to/from the VM (push mirrors incl. .git,
+                                         pull is additive and skips .git unless --git)
+  console <name>                         attach to the serial console
+  clone <src> <dst>                      copy a stopped VM (new seed, new ports)
+  delete <name> [--force]                remove a VM (--force stops it first)
+  snapshot create <vm> [name]            qcow2 checkpoint of a stopped VM's disk
+  snapshot list <vm>
+  snapshot revert <vm> <name>
+  snapshot delete <vm> <name>
+
+Defaults: cpus=$QEMUCTL_DEFAULT_CPUS mem=$QEMUCTL_DEFAULT_MEM ports from $QEMUCTL_PORT_BASE; env QEMUCTL_HOME, QEMUCTL_DEFAULT_IMAGE, QEMUCTL_PORT_BASE.
+EOF
+}
+
+pick_default_image() {
+  if [ -n "$QEMUCTL_DEFAULT_IMAGE" ]; then echo "$QEMUCTL_DEFAULT_IMAGE"; return; fi
+  local imgs=()
+  for f in "$IMAGES_DIR"/*.qcow2; do [ -e "$f" ] && imgs+=("$(basename "$f" .qcow2)"); done
+  case ${#imgs[@]} in
+    0) die "no images yet; run 'qemuctl image pull ubuntu-22.04' first" ;;
+    1) echo "${imgs[0]}" ;;
+    *) die "several images available (${imgs[*]}); pick one with --image" ;;
+  esac
+}
+
+cmd_vm_create() {
+  local name="" image="" cpus=$QEMUCTL_DEFAULT_CPUS mem=$QEMUCTL_DEFAULT_MEM disk="" ssh_port="" start=0
+  local -a pspecs=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --image|-i) image=$2; shift 2 ;;
+      --cpus|-c) cpus=$2; shift 2 ;;
+      --mem|--memory|-m) mem=$2; shift 2 ;;
+      --disk|-d) disk=$2; shift 2 ;;
+      -p|--port) pspecs+=("$2"); shift 2 ;;
+      --ssh-port) ssh_port=$2; shift 2 ;;
+      --start|-s) start=1; shift ;;
+      -h|--help) usage_vm; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) [ -z "$name" ] || die "unexpected argument: $1"; name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: qemuctl vm create <name> [options]  (see 'qemuctl vm --help')"
+  validate_name "$name"
+  ! vm_exists "$name" || die "VM '$name' already exists"
+  [ ! -e "$VMS_DIR/$name" ] || die "$VMS_DIR/$name exists but has no vm.conf; remove it manually"
+  validate_int "$cpus" "--cpus"; validate_mem "$mem"
+  [ -n "$image" ] || image=$(pick_default_image)
+  require_image "$image"
+  need qemu-img "apt install qemu-utils"
+
+  # Ports: ssh first, then extras. Extras are "guest" (auto host port) or "host:guest".
+  local ports="" spec host guest
+  if [ -n "$ssh_port" ]; then claim_port "$ssh_port"; else alloc_port; ssh_port=$ALLOC; fi
+  for spec in "${pspecs[@]}"; do
+    [[ "$spec" =~ ^([0-9]+:)?[0-9]+$ ]] || die "bad port spec '$spec' (use guest or host:guest)"
+    guest=${spec##*:}; validate_port "$guest"
+    if [[ "$spec" == *:* ]]; then host=${spec%%:*}; claim_port "$host"; else alloc_port; host=$ALLOC; fi
+    ports+="${ports:+ }$host:$guest"
+  done
+
+  local d="$VMS_DIR/$name"
+  mkdir -p "$d"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$d'; log 'create failed; cleaned up $d'" ERR
+  qemu-img create -q -f qcow2 -F qcow2 -b "$(image_path "$image")" "$d/disk.qcow2"
+  [ -z "$disk" ] || qemu-img resize -q "$d/disk.qcow2" "$disk"
+  write_seed "$name"
+  write_conf "$d" "$image" "$cpus" "$mem" "$ssh_port" "$ports" "$(date -Is)"
+  trap - ERR
+  log "VM '$name' created: image=$image cpus=$cpus mem=$mem ssh=127.0.0.1:$ssh_port${ports:+ ports=$ports}"
+  [ "$start" -eq 0 ] || cmd_vm_start "$name"
+}
+
+cmd_vm_start() {
+  local dry=0 name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run|-n) dry=1; shift ;;
+      -h|--help) usage_vm; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: qemuctl vm start <name> [--dry-run]"
+  load_vm "$name"
+  if is_running "$VM"; then die "VM '$VM' is already running (pid $(vm_pid "$VM"))"; fi
+  [ -f "$VM_DIR/disk.qcow2" ] || die "missing $VM_DIR/disk.qcow2"
+  [ -f "$VM_DIR/seed.img" ] || write_seed "$VM"
+
+  # Re-check that this VM's ports are still free on the host (another process
+  # or a VM started elsewhere may have taken them meanwhile).
+  local p owner
+  for p in "$SSH_PORT" $(for m in $PORTS; do echo "${m%%:*}"; done); do
+    if listening_ports | grep -qx "$p"; then
+      owner=$(port_owner "$p" || true)
+      die "host port $p is in use${owner:+ (reserved by VM '$owner')}; edit $VM_DIR/vm.conf or stop the other user"
+    fi
+  done
+
+  build_qemu_cmd
+  if [ "$dry" -eq 1 ]; then
+    printf '%s' "$(kvm_prefix)"; printf '%q ' "${QEMU_CMD[@]}"; echo
+    return 0
+  fi
+  need "$QEMU_BIN" "apt install qemu-system-x86"
+  clean_stale "$VM"
+  run_qemu "${QEMU_CMD[@]}"
+  fix_owner
+  for _ in $(seq 1 50); do is_running "$VM" && break; sleep 0.1; done
+  is_running "$VM" || die "qemu did not come up; check $VM_DIR/serial.log"
+  log "VM '$VM' started (pid $(vm_pid "$VM")). ssh: qemuctl vm ssh $VM   console: qemuctl vm console $VM"
+}
+
+cmd_vm_stop() {
+  local force=0 name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force|-f) force=1; shift ;;
+      -h|--help) usage_vm; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: qemuctl vm stop <name> [--force]"
+  load_vm "$name"
+  local pid
+  if ! pid=$(vm_pid "$VM"); then log "VM '$VM' is not running"; clean_stale "$VM"; return 0; fi
+  local kill_cmd=(kill); [ -w "/proc/$pid" ] || kill_cmd=(sudo kill)
+  if [ "$force" -eq 0 ]; then
+    log "sending ACPI powerdown to '$VM' (pid $pid), waiting up to ${QEMUCTL_STOP_TIMEOUT}s"
+    sock_send "$VM_DIR/monitor.sock" "system_powerdown"
+    for _ in $(seq 1 "$QEMUCTL_STOP_TIMEOUT"); do [ -d "/proc/$pid" ] || break; sleep 1; done
+  fi
+  if [ -d "/proc/$pid" ]; then
+    log "killing '$VM' (pid $pid)"
+    "${kill_cmd[@]}" "$pid" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do [ -d "/proc/$pid" ] || break; sleep 1; done
+    [ -d "/proc/$pid" ] && "${kill_cmd[@]}" -9 "$pid" 2>/dev/null || true
+  fi
+  clean_stale "$VM"
+  log "VM '$VM' stopped"
+}
+
+cmd_vm_restart() {
+  [ $# -eq 1 ] || die "usage: qemuctl vm restart <name>"
+  cmd_vm_stop "$1"; cmd_vm_start "$1"
+}
+
+cmd_vm_list() {
+  local d name
+  printf '%-16s %-8s %-20s %-4s %-6s %-6s %s\n' NAME STATE IMAGE CPUS MEM SSH PORTS
+  for d in "$VMS_DIR"/*/; do
+    [ -f "$d/vm.conf" ] || continue
+    name=$(basename "$d")
+    load_vm "$name"
+    printf '%-16s %-8s %-20s %-4s %-6s %-6s %s\n' "$VM" "$(vm_state "$VM")" "$IMAGE" "$CPUS" "$MEM" "$SSH_PORT" "${PORTS:--}"
+  done
+}
+
+cmd_vm_info() {
+  [ $# -eq 1 ] || die "usage: qemuctl vm info <name>"
+  load_vm "$1"
+  local pid; pid=$(vm_pid "$VM" || true)
+  cat <<EOF
+name      : $VM
+state     : $(vm_state "$VM")${pid:+ (pid $pid)}
+image     : $IMAGE
+cpus      : $CPUS
+memory    : $MEM
+ssh       : ssh -p $SSH_PORT $QEMUCTL_SSH_USER@127.0.0.1   (password: $QEMUCTL_PASSWORD)
+ports     : ${PORTS:--}   (host:guest)
+created   : $CREATED
+dir       : $VM_DIR
+disk      : $(qemu_img_field "$VM_DIR/disk.qcow2" "virtual size" | awk '{print $1 $2}') virtual, $(qemu_img_field "$VM_DIR/disk.qcow2" "disk size" | awk '{print $1 $2}') on disk
+serial log: $VM_DIR/serial.log
+EOF
+}
+
+cmd_vm_ssh() {
+  [ $# -ge 1 ] || die "usage: qemuctl vm ssh <name> [-- cmd ...]"
+  load_vm "$1"; shift
+  [ "${1:-}" != "--" ] || shift
+  is_running "$VM" || die "VM '$VM' is not running"
+  local opts; mapfile -t opts < <(ssh_opts)
+  exec ssh -p "$SSH_PORT" "${opts[@]}" "$QEMUCTL_SSH_USER@127.0.0.1" "$@"
+}
+
+ssh_opts() {  # options shared by ssh, scp and rsync's transport
+  printf '%s\n' -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR
+}
+
+# qemuctl vm scp <name> [scp options] <src>... <dst>
+# Arguments starting with ':' are paths inside the VM (like scp's host:path).
+cmd_vm_scp() {
+  [ $# -ge 3 ] || die "usage: qemuctl vm scp <name> [-r] <src>... <dst>   (':path' = inside the VM)"
+  load_vm "$1"; shift
+  is_running "$VM" || die "VM '$VM' is not running"
+  local a args=() remote=0
+  for a in "$@"; do
+    case "$a" in
+      :*) args+=("$QEMUCTL_SSH_USER@127.0.0.1$a"); remote=1 ;;
+      *)  args+=("$a") ;;
+    esac
+  done
+  [ "$remote" -eq 1 ] || die "no VM-side path given; prefix it with ':' e.g.  qemuctl vm scp $VM ./file :/tmp/"
+  local opts; mapfile -t opts < <(ssh_opts)
+  exec scp -P "$SSH_PORT" "${opts[@]}" "${args[@]}"
+}
+
+# qemuctl vm sync <name> push|pull [local_dir] [remote_dir] [options]
+#   push: local is authoritative — mirror everything, including .git
+#   pull: VM is a worker — bring changes back additively, skipping .git
+# Defaults for the dirs come from QEMUCTL_SYNC_LOCAL / QEMUCTL_SYNC_REMOTE.
+cmd_vm_sync() {
+  [ $# -ge 2 ] || die "usage: qemuctl vm sync <name> push|pull [local_dir] [remote_dir] [--delete] [--git] [-n] [--exclude PAT]..."
+  load_vm "$1"; shift
+  local direction="" local_dir="" remote_dir="" delete=0 git=0 dry=0 pos=0
+  local -a excludes=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --delete) delete=1; shift ;;
+      --git|--include-git) git=1; shift ;;
+      -n|--dry-run) dry=1; shift ;;
+      --exclude) excludes+=(--exclude="$2"); shift 2 ;;
+      --exclude=*) excludes+=("$1"); shift ;;
+      -h|--help) usage_vm; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *)
+        case $pos in
+          0) direction=$1 ;; 1) local_dir=$1 ;; 2) remote_dir=$1 ;;
+          *) die "unexpected argument: $1" ;;
+        esac
+        pos=$((pos + 1)); shift ;;
+    esac
+  done
+  [[ "$direction" == push || "$direction" == pull ]] || die "direction must be 'push' or 'pull'"
+  [ -n "$local_dir" ]  || local_dir=$QEMUCTL_SYNC_LOCAL
+  [ -n "$remote_dir" ] || remote_dir=$QEMUCTL_SYNC_REMOTE
+  [ -n "$local_dir" ]  || die "no local dir: pass it or set QEMUCTL_SYNC_LOCAL"
+  [ -n "$remote_dir" ] || die "no remote dir: pass it or set QEMUCTL_SYNC_REMOTE"
+  [ -d "$local_dir" ] || [ "$direction" = pull ] || die "local dir does not exist: $local_dir"
+  [[ "$local_dir"  == */ ]] || local_dir+=/      # trailing slash: sync contents, not the dir itself
+  [[ "$remote_dir" == */ ]] || remote_dir+=/
+  is_running "$VM" || die "VM '$VM' is not running"
+  need rsync "apt install rsync"
+
+  local remote="$QEMUCTL_SSH_USER@127.0.0.1:$remote_dir" opts
+  mapfile -t opts < <(ssh_opts)
+  local -a rs=(-az --partial --human-readable --stats -e "ssh -p $SSH_PORT ${opts[*]}" "${excludes[@]}")
+  [ "$delete" -eq 0 ] || rs+=(--delete)
+  [ "$dry" -eq 0 ] || rs+=(--dry-run --itemize-changes)
+
+  # one sync per VM at a time
+  exec 9>"$VM_DIR/sync.lock"
+  flock -n 9 || die "another sync for '$VM' is running"
+  local logf="$VM_DIR/sync.log"
+  slog() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$logf" >&2; }
+  case "$direction" in
+    push)
+      slog "PUSH $local_dir -> $VM:$remote_dir$( [ "$delete" -eq 1 ] && echo ' [--delete]')$( [ "$dry" -eq 1 ] && echo ' [dry-run]')"
+      # create the target dir inside the same ssh session rsync opens
+      rsync "${rs[@]}" --rsync-path="mkdir -p '$remote_dir' && rsync" "$local_dir" "$remote" ;;
+    pull)
+      [ "$git" -eq 1 ] || rs+=(--exclude=.git/)
+      slog "PULL $VM:$remote_dir -> $local_dir$( [ "$git" -eq 0 ] && echo ' [excluding .git]')$( [ "$dry" -eq 1 ] && echo ' [dry-run]')"
+      [ "$dry" -eq 1 ] || mkdir -p "$local_dir"
+      rsync "${rs[@]}" "$remote" "$local_dir" ;;
+  esac
+  slog "done ($direction)"
+}
+
+cmd_vm_console() {
+  [ $# -eq 1 ] || die "usage: qemuctl vm console <name>"
+  load_vm "$1"
+  is_running "$VM" || die "VM '$VM' is not running"
+  local sock="$VM_DIR/serial.sock" pre=()
+  [ -w "$sock" ] || pre=(sudo)
+  if have socat && [ -t 0 ]; then
+    log "connected to '$VM' serial console — press Ctrl-] to detach"
+    exec "${pre[@]}" socat "-,raw,echo=0,escape=0x1d" "UNIX-CONNECT:$sock"
+  elif have socat; then
+    # stdin is not a terminal (piped input): plain relay, EOF ends it
+    exec "${pre[@]}" socat - "UNIX-CONNECT:$sock"
+  elif have nc; then
+    log "connected to '$VM' serial console via nc (line-buffered) — press Ctrl-C to detach; install socat for a raw tty"
+    exec "${pre[@]}" nc -U "$sock"
+  else
+    die "need socat (apt install socat) or nc to attach to $sock"
+  fi
+}
+
+cmd_vm_clone() {
+  [ $# -eq 2 ] || die "usage: qemuctl vm clone <src> <dst>"
+  load_vm "$1"; local dst=$2
+  validate_name "$dst"
+  ! vm_exists "$dst" || die "VM '$dst' already exists"
+  require_stopped "$VM"
+  local d="$VMS_DIR/$dst" ports="" m host
+  mkdir -p "$d"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$d'; log 'clone failed; cleaned up $d'" ERR
+  cp --reflink=auto "$VM_DIR/disk.qcow2" "$d/disk.qcow2"   # keeps the absolute backing-file path
+  local ssh_port; alloc_port; ssh_port=$ALLOC
+  for m in $PORTS; do alloc_port; host=$ALLOC; ports+="${ports:+ }$host:${m##*:}"; done
+  write_seed "$dst"
+  write_conf "$d" "$IMAGE" "$CPUS" "$MEM" "$ssh_port" "$ports" "$(date -Is)"
+  trap - ERR
+  log "VM '$dst' cloned from '$VM': ssh=127.0.0.1:$ssh_port${ports:+ ports=$ports}"
+}
+
+cmd_vm_delete() {
+  local force=0 name=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force|-f) force=1; shift ;;
+      -h|--help) usage_vm; return 0 ;;
+      -*) die "unknown option: $1" ;;
+      *) name=$1; shift ;;
+    esac
+  done
+  [ -n "$name" ] || die "usage: qemuctl vm delete <name> [--force]"
+  load_vm "$name"
+  if is_running "$VM"; then
+    [ "$force" -eq 1 ] || die "VM '$VM' is running; stop it or use --force"
+    cmd_vm_stop "$VM" --force
+  fi
+  rm -rf "${VMS_DIR:?}/${VM:?}"
+  log "VM '$VM' deleted"
+}
+
+cmd_vm_snapshot() {
+  local sub=${1:-}; shift || true
+  local snap
+  case "$sub" in
+    create|c)
+      [ $# -ge 1 ] && [ $# -le 2 ] || die "usage: qemuctl vm snapshot create <vm> [name]"
+      load_vm "$1"; snap=${2:-$(date +%Y%m%d-%H%M%S)}; validate_name "$snap"
+      require_stopped "$VM"
+      qemu-img snapshot -c "$snap" "$VM_DIR/disk.qcow2"
+      log "snapshot '$snap' created for VM '$VM'" ;;
+    list|ls|l)
+      [ $# -eq 1 ] || die "usage: qemuctl vm snapshot list <vm>"
+      load_vm "$1"
+      qemu-img snapshot -l "$VM_DIR/disk.qcow2" ;;
+    revert|apply|a)
+      [ $# -eq 2 ] || die "usage: qemuctl vm snapshot revert <vm> <name>"
+      load_vm "$1"; validate_name "$2"
+      require_stopped "$VM"
+      qemu-img snapshot -a "$2" "$VM_DIR/disk.qcow2"
+      log "VM '$VM' disk reverted to snapshot '$2'" ;;
+    delete|rm|d)
+      [ $# -eq 2 ] || die "usage: qemuctl vm snapshot delete <vm> <name>"
+      load_vm "$1"; validate_name "$2"
+      require_stopped "$VM"
+      qemu-img snapshot -d "$2" "$VM_DIR/disk.qcow2"
+      log "snapshot '$2' deleted from VM '$VM'" ;;
+    *) die "usage: qemuctl vm snapshot create|list|revert|delete <vm> [name]" ;;
+  esac
+}
+
+cmd_vm() {
+  local sub=${1:-list}; shift || true
+  case "$sub" in
+    create|new) cmd_vm_create "$@" ;;
+    start|up) cmd_vm_start "$@" ;;
+    stop|down|shutdown) cmd_vm_stop "$@" ;;
+    restart|reboot) cmd_vm_restart "$@" ;;
+    list|ls) cmd_vm_list "$@" ;;
+    info|show) cmd_vm_info "$@" ;;
+    ssh) cmd_vm_ssh "$@" ;;
+    scp|cp) cmd_vm_scp "$@" ;;
+    sync|rsync) cmd_vm_sync "$@" ;;
+    console|serial) cmd_vm_console "$@" ;;
+    clone) cmd_vm_clone "$@" ;;
+    delete|rm|destroy) cmd_vm_delete "$@" ;;
+    snapshot|snap) cmd_vm_snapshot "$@" ;;
+    -h|--help|help) usage_vm ;;
+    *) usage_vm >&2; log "qemuctl: unknown vm command: $sub"; exit 2 ;;
+  esac
+}
+
+# ============================================================== dispatch ====
+usage() {
+  cat <<EOF
+qemuctl — light kcli-style manager for qemu/KVM VMs from cloud images
+
+Usage: qemuctl <group> <command> [args]
+
+  qemuctl doctor                       check dependencies and KVM access
+  qemuctl image ...                    manage base images        (qemuctl image --help)
+  qemuctl vm ...                       manage VMs and snapshots  (qemuctl vm --help)
+
+VM commands can be used without the 'vm' word, e.g.:
+  qemuctl create web -p 8080 --start   qemuctl ssh web   qemuctl list   qemuctl stop web
+
+Quick start:
+  qemuctl image pull ubuntu-22.04
+  qemuctl vm create dev -p 8080 --start
+  qemuctl vm ssh dev                    (user $QEMUCTL_SSH_USER, password $QEMUCTL_PASSWORD)
+  qemuctl vm scp dev ./file :/tmp/      qemuctl vm sync dev push ./work /home/ubuntu/work
+
+Layout: $QEMUCTL_HOME/{images,vms}/   (override with QEMUCTL_HOME)
+EOF
+}
+
+main() {
+  mkdir -p "$IMAGES_DIR" "$VMS_DIR"
+  local group=${1:-help}; shift || true
+  case "$group" in
+    doctor) cmd_doctor "$@" ;;
+    image|images|img) cmd_image "$@" ;;
+    vm|vms) cmd_vm "$@" ;;
+    create|new|start|up|stop|down|shutdown|restart|reboot|list|ls|info|show|ssh|scp|cp|sync|rsync|console|serial|clone|delete|rm|destroy|snapshot|snap)
+      cmd_vm "$group" "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; log "qemuctl: unknown command: $group"; exit 2 ;;
+  esac
+}
+
+main "$@"
